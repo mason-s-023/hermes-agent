@@ -60,7 +60,52 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks  # type: ignore
 
 
+def _touch_inbound_heartbeat(event_type: str = "event") -> None:
+    """Slack inbound 수신 시 heartbeat 파일을 갱신한다 — Socket Mode 수신 생존 감시용.
+
+    프로세스가 살아있어도 소켓이 끊긴 '좀비' 상태(예: DNS 일시장애 후 재연결 실패)를
+    관제탑(Monitoring-dashboard)의 hermes_gateway_watchdog이 이 파일 mtime freshness로
+    잡아 자동 kickstart 한다. 경로 규약:
+      1) env HERMES_SLACK_INBOUND_HEARTBEAT_PATH 있으면 그 경로
+      2) 없으면 ~/.gbrain/.heartbeat/hermes-gateway-<name>.last_inbound
+         (name = HERMES_GATEWAY_NAME / HERMES_PROFILE / 활성 프로파일명 / "default")
+    heartbeat 실패가 슬랙 처리 자체를 죽이면 안 되므로 전부 삼킨다.
+    """
+    try:
+        raw = os.getenv("HERMES_SLACK_INBOUND_HEARTBEAT_PATH", "").strip()
+        if raw:
+            path = _Path(os.path.expandvars(os.path.expanduser(raw)))
+        else:
+            name = (
+                os.getenv("HERMES_GATEWAY_NAME") or os.getenv("HERMES_PROFILE") or ""
+            ).strip()
+            if not name:
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+
+                    name = (get_active_profile_name() or "").strip()
+                except Exception:
+                    name = ""
+            if not name:
+                name = "default"
+            path = (
+                _Path.home()
+                / ".gbrain"
+                / ".heartbeat"
+                / f"hermes-gateway-{name}.last_inbound"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"ts": time.time(), "event": event_type}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 logger = logging.getLogger(__name__)
+_SLACK_USER_MENTION_TOKEN_RE = re.compile(r"<@([^>\s|]+)(?:\|[^>]+)?>")
+_SLACK_ROUTING_HEADER_SEPARATORS = " \t,"
 
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
@@ -2523,6 +2568,8 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
+        # Socket Mode 수신 생존 heartbeat — dedup/게이팅 이전에 찍어 '소켓이 살아있음'만 순수 측정
+        _touch_inbound_heartbeat("message")
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
@@ -2540,8 +2587,11 @@ class SlackAdapter(BasePlatformAdapter):
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
-                text_check = event.get("text", "")
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                msg_team = event.get("team") or event.get("team_id") or ""
+                bot_uid = self._team_bot_user_ids.get(msg_team, self._bot_user_id)
+                if not bot_uid or bot_uid not in self._slack_routing_header_mentions(
+                    event.get("text", "")
+                ):
                     return
             # "all" falls through to process the message
             # Always ignore our own messages to prevent echo loops
@@ -2751,10 +2801,8 @@ class SlackAdapter(BasePlatformAdapter):
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
-        is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
-            or self._slack_message_matches_mention_patterns(routing_text)
-        )
+        routing_mentions = self._slack_routing_header_mentions(routing_text)
+        is_mentioned = bool(bot_uid and bot_uid in routing_mentions)
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -2794,8 +2842,8 @@ class SlackAdapter(BasePlatformAdapter):
                     return
 
         if is_mentioned:
-            # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+            # Strip only the routing header; raw mentions in the body are content.
+            text = self._strip_slack_routing_header(text)
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
@@ -3830,6 +3878,8 @@ class SlackAdapter(BasePlatformAdapter):
         what's the weather`` — non-slash text is treated as a regular
         message).
         """
+        # Socket Mode 수신 생존 heartbeat (슬래시 커맨드 경로)
+        _touch_inbound_heartbeat("slash")
         slash_name = (command.get("command") or "").lstrip("/").strip()
         text = command.get("text", "").strip()
         user_id = command.get("user_id", "")
@@ -4072,6 +4122,64 @@ class SlackAdapter(BasePlatformAdapter):
                     raise
 
     # ── Channel mention gating ─────────────────────────────────────────────
+
+    @staticmethod
+    def _slack_routing_header_span(
+        text: str,
+    ) -> Tuple[set[str], Optional[Tuple[int, int]]]:
+        """Return leading Slack user mentions on the first non-empty line.
+
+        Only the first non-empty line may carry routing metadata, and only
+        Slack user mention tokens at the start of that line count. Mentions in
+        body text, quoted lines, or fenced code blocks remain ordinary content.
+        """
+        if not text:
+            return set(), None
+
+        offset = 0
+        for raw_line in text.splitlines(keepends=True):
+            newline_len = len(raw_line) - len(raw_line.rstrip("\r\n"))
+            line = raw_line[:-newline_len] if newline_len else raw_line
+            if not line.strip():
+                offset += len(raw_line)
+                continue
+
+            leading_ws = len(line) - len(line.lstrip(" \t"))
+            scan_pos = leading_ws
+            span_end = scan_pos
+            mention_ids: set[str] = set()
+
+            while True:
+                match = _SLACK_USER_MENTION_TOKEN_RE.match(line, scan_pos)
+                if not match:
+                    break
+                mention_ids.add(match.group(1))
+                scan_pos = match.end()
+                while (
+                    scan_pos < len(line)
+                    and line[scan_pos] in _SLACK_ROUTING_HEADER_SEPARATORS
+                ):
+                    scan_pos += 1
+                span_end = scan_pos
+
+            if not mention_ids:
+                return set(), None
+            return mention_ids, (offset + leading_ws, offset + span_end)
+
+        return set(), None
+
+    def _slack_routing_header_mentions(self, text: str) -> set[str]:
+        """Return user IDs mentioned in Slack's first-line routing header."""
+        mention_ids, _ = self._slack_routing_header_span(text)
+        return mention_ids
+
+    def _strip_slack_routing_header(self, text: str) -> str:
+        """Remove the routing header from text, preserving body mentions."""
+        _, span = self._slack_routing_header_span(text)
+        if not span:
+            return text.strip()
+        start, end = span
+        return (text[:start] + text[end:]).strip()
 
     def _slack_require_mention(self) -> bool:
         """Return whether channel messages require an explicit bot mention.
