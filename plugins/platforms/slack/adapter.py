@@ -61,11 +61,12 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 
 def _touch_inbound_heartbeat(event_type: str = "event") -> None:
-    """Slack inbound 수신 시 heartbeat 파일을 갱신한다 — Socket Mode 수신 생존 감시용.
+    """Slack Socket Mode heartbeat 파일을 갱신한다.
 
     프로세스가 살아있어도 소켓이 끊긴 '좀비' 상태(예: DNS 일시장애 후 재연결 실패)를
     관제탑(Monitoring-dashboard)의 hermes_gateway_watchdog이 이 파일 mtime freshness로
-    잡아 자동 kickstart 한다. 경로 규약:
+    잡아 자동 kickstart 한다. 메시지/슬래시 inbound뿐 아니라 Socket Mode 연결 성공과
+    transport watchdog의 connected=True 확인도 같은 파일을 갱신한다. 경로 규약:
       1) env HERMES_SLACK_INBOUND_HEARTBEAT_PATH 있으면 그 경로
       2) 없으면 ~/.gbrain/.heartbeat/hermes-gateway-<name>.last_inbound
          (name = HERMES_GATEWAY_NAME / HERMES_PROFILE / 활성 프로파일명 / "default")
@@ -105,6 +106,7 @@ def _touch_inbound_heartbeat(event_type: str = "event") -> None:
 
 logger = logging.getLogger(__name__)
 _SLACK_USER_MENTION_TOKEN_RE = re.compile(r"<@([^>\s|]+)(?:\|[^>]+)?>")
+_SLACK_HANDOFF_MARKER_MODE_RE = re.compile(r"^\s*⟦[^⟧]*\|mode=([a-z]+)\b[^⟧]*⟧\s*$")
 _SLACK_ROUTING_HEADER_SEPARATORS = " \t,"
 
 # ContextVar carrying the user_id of the slash-command invoker.
@@ -631,6 +633,8 @@ class SlackAdapter(BasePlatformAdapter):
                 connected = await self._socket_transport_connected()
                 if connected is False:
                     await self._restart_socket_mode("transport disconnected")
+                elif connected is True:
+                    _touch_inbound_heartbeat("socket_watchdog")
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1297,6 +1301,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Socket Mode connected (%d workspace(s))",
                 len(self._team_clients),
             )
+            _touch_inbound_heartbeat("socket_connected")
             return True
 
         except Exception as e:  # pragma: no cover - defensive logging
@@ -2589,8 +2594,10 @@ class SlackAdapter(BasePlatformAdapter):
             elif allow_bots == "mentions":
                 msg_team = event.get("team") or event.get("team_id") or ""
                 bot_uid = self._team_bot_user_ids.get(msg_team, self._bot_user_id)
-                if not bot_uid or bot_uid not in self._slack_routing_header_mentions(
-                    event.get("text", "")
+                raw_text = event.get("text", "")
+                if not bot_uid or not (
+                    bot_uid in self._slack_routing_header_mentions(raw_text)
+                    or self._slack_directed_handoff_mentions(raw_text, bot_uid)
                 ):
                     return
             # "all" falls through to process the message
@@ -2802,7 +2809,12 @@ class SlackAdapter(BasePlatformAdapter):
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
         routing_mentions = self._slack_routing_header_mentions(routing_text)
-        is_mentioned = bool(bot_uid and bot_uid in routing_mentions)
+        is_directed_handoff = bool(
+            bot_uid and self._slack_directed_handoff_mentions(routing_text, bot_uid)
+        )
+        is_mentioned = bool(
+            bot_uid and (bot_uid in routing_mentions or is_directed_handoff)
+        )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -4172,6 +4184,32 @@ class SlackAdapter(BasePlatformAdapter):
         """Return user IDs mentioned in Slack's first-line routing header."""
         mention_ids, _ = self._slack_routing_header_span(text)
         return mention_ids
+
+    @staticmethod
+    def _slack_handoff_marker_mode(text: str) -> str:
+        """Return ask/reply/final from the first-line handoff marker, if present."""
+        if not text:
+            return ""
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            match = _SLACK_HANDOFF_MARKER_MODE_RE.match(line)
+            return match.group(1).lower() if match else ""
+        return ""
+
+    def _slack_directed_handoff_mentions(self, text: str, user_id: str) -> bool:
+        """True for bot handoff markers explicitly directed at this Slack user.
+
+        Normal Slack channel routing remains strict: only leading first-line
+        mentions wake the bot. Bot-to-bot Hermes handoffs are the exception:
+        their first line is the loop-guard marker, so the raw self mention lives
+        in the body. Accept only non-final handoffs to avoid reopening completed
+        loops.
+        """
+        mode = self._slack_handoff_marker_mode(text)
+        if mode not in {"ask", "reply"}:
+            return False
+        return user_id in set(_SLACK_USER_MENTION_TOKEN_RE.findall(text or ""))
 
     def _strip_slack_routing_header(self, text: str) -> str:
         """Remove the routing header from text, preserving body mentions."""

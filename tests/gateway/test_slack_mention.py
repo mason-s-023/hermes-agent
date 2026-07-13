@@ -253,8 +253,11 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
     if mentioned:
         text = f"<@{bot_uid}> {text}"
     is_mentioned = bool(
-        (bot_uid and f"<@{bot_uid}>" in text)
-        or adapter._slack_message_matches_mention_patterns(text)
+        bot_uid
+        and (
+            bot_uid in adapter._slack_routing_header_mentions(text)
+            or adapter._slack_directed_handoff_mentions(text, bot_uid)
+        )
     )
 
     if not is_dm and bot_uid:
@@ -309,6 +312,60 @@ def test_dm_always_processed_regardless_of_setting():
 def test_mentioned_message_always_processed():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(adapter, mentioned=True, text="what's up") is True
+
+
+def test_routing_header_mentions_first_non_empty_line_leading_mentions():
+    adapter = _make_adapter()
+    assert adapter._slack_routing_header_mentions(
+        "\n\n  <@U_BOT_123>, <@U_OTHER> please coordinate\n<@U_THIRD> body"
+    ) == {"U_BOT_123", "U_OTHER"}
+
+
+def test_routing_header_mentions_ignores_body_and_later_lines():
+    adapter = _make_adapter()
+    assert adapter._slack_routing_header_mentions(
+        "handoff body <@U_BOT_123>\n<@U_OTHER> second line"
+    ) == set()
+
+
+def test_routing_header_mentions_ignores_quotes_and_code_blocks():
+    adapter = _make_adapter()
+    assert adapter._slack_routing_header_mentions("> <@U_BOT_123> quote") == set()
+    assert adapter._slack_routing_header_mentions(
+        "```\n<@U_BOT_123> code\n```"
+    ) == set()
+
+
+def test_directed_handoff_mentions_accepts_reply_marker_body_mention():
+    adapter = _make_adapter()
+    text = (
+        "⟦chadol|v1|h=agent:apom-team:margin-guard|hop=2|"
+        "seen=sigma,chadol|mode=reply⟧\n\n"
+        "<@U_BOT_123> 차미에게 넘김."
+    )
+    assert adapter._slack_directed_handoff_mentions(text, "U_BOT_123") is True
+
+
+def test_directed_handoff_mentions_rejects_final_and_non_marker_body_mentions():
+    adapter = _make_adapter()
+    assert adapter._slack_directed_handoff_mentions(
+        "⟦chadol|v1|h=x|hop=2|seen=sigma,chadol|mode=final⟧\n<@U_BOT_123> 끝.",
+        "U_BOT_123",
+    ) is False
+    assert adapter._slack_directed_handoff_mentions(
+        "handoff report\n<@U_BOT_123> mentioned inside the body",
+        "U_BOT_123",
+    ) is False
+
+
+def test_directed_handoff_body_mention_triggers_channel_gate():
+    adapter = _make_adapter(require_mention=True)
+    text = (
+        "⟦chadol|v1|h=agent:apom-team:margin-guard|hop=2|"
+        "seen=sigma,chadol|mode=reply⟧\n\n"
+        "<@U_BOT_123> 차미에게 넘김."
+    )
+    assert _would_process(adapter, text=text) is True
 
 
 def test_thread_reply_with_active_session_processed():
@@ -745,9 +802,9 @@ def test_mention_patterns_env_var_csv_fallback_splits_patterns(monkeypatch):
     assert adapter._slack_message_matches_mention_patterns("hey hermes") is True
 
 
-def test_mention_patterns_trigger_in_channel_without_literal_mention():
-    """A wake word triggers the bot in a channel even with require_mention on."""
+def test_mention_patterns_do_not_bypass_routing_header_mentions():
+    """Wake words do not bypass Slack's first-line routing header gate."""
     adapter = _make_adapter(require_mention=True, mention_patterns=["hey hermes"])
-    assert _would_process(adapter, text="hey hermes what's the status") is True
+    assert _would_process(adapter, text="hey hermes what's the status") is False
     # Unrelated channel chatter is still ignored.
     assert _would_process(adapter, text="lunch anyone?") is False

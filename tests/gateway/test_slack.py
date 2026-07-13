@@ -124,6 +124,15 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.VIDEO_CACHE_DIR", tmp_path / "video_cache"
     )
+    for name in (
+        "SLACK_ALLOWED_CHANNELS",
+        "SLACK_REQUIRE_MENTION",
+        "SLACK_STRICT_MENTION",
+        "SLACK_FREE_RESPONSE_CHANNELS",
+        "SLACK_MENTION_PATTERNS",
+        "SLACK_ALLOW_BOTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1974,6 +1983,21 @@ class TestMessageRouting:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_channel_first_non_empty_line_leading_mention_triggers(self, adapter):
+        """Only a leading mention on the first non-empty line is a routing header."""
+        event = {
+            "text": "\n\n  <@U_BOT> what's the weather?",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "2234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "what's the weather?"
+
+    @pytest.mark.asyncio
     async def test_channel_mention_strips_bot_id(self, adapter):
         """When mentioned in a channel, the bot mention should be stripped."""
         event = {
@@ -1987,6 +2011,143 @@ class TestMessageRouting:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "what's the weather?"
         assert "<@U_BOT>" not in msg_event.text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Please ask <@U_BOT> to check this",
+            "Context line\n<@U_BOT> second line mention",
+            "> <@U_BOT> quoted mention",
+            "```\n<@U_BOT> code block mention\n```",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_channel_non_header_raw_mentions_do_not_trigger(self, adapter, text):
+        """Raw mentions outside the routing header are content, not triggers."""
+        event = {
+            "text": text,
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "2234567890.000002",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_mentions_requires_routing_header(self):
+        """Bot messages with body mentions must not pass allow_bots=mentions."""
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"allow_bots": "mentions"},
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._bot_user_id = "U_BOT"
+        adapter._running = True
+        adapter.handle_message = AsyncMock()
+
+        event = {
+            "text": "handoff report\n<@U_BOT> mentioned inside the body",
+            "bot_id": "B_OTHER",
+            "user": "U_OTHER_BOT",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "2234567890.000003",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_mentions_accepts_directed_handoff_body_mention(self):
+        """Bot handoffs put the loop marker first and the target mention in the body."""
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"allow_bots": "mentions"},
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._bot_user_id = "U_BOT"
+        adapter._running = True
+        adapter.handle_message = AsyncMock()
+
+        event = {
+            "text": (
+                "⟦chadol|v1|h=agent:apom-team:margin-guard|hop=2|"
+                "seen=sigma,chadol|mode=reply⟧\n\n"
+                "<@U_BOT> 차미에게 넘김.\n결론: 실제 적자 SKU 경보."
+            ),
+            "bot_id": "B_OTHER",
+            "user": "U_OTHER_BOT",
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "1234567890.000000",
+            "ts": "2234567890.000004",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "mode=reply" in msg_event.text
+        assert "<@U_BOT>" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_mentions_rejects_final_handoff_body_mention(self):
+        """mode=final is a closed loop signal and must not wake the bot."""
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"allow_bots": "mentions"},
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._bot_user_id = "U_BOT"
+        adapter._running = True
+        adapter.handle_message = AsyncMock()
+
+        event = {
+            "text": "⟦chadol|v1|h=x|hop=2|seen=sigma,chadol|mode=final⟧\n<@U_BOT> 끝.",
+            "bot_id": "B_OTHER",
+            "user": "U_OTHER_BOT",
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "1234567890.000000",
+            "ts": "2234567890.000005",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_mentions_accepts_leading_routing_header(self):
+        """Bot messages still pass when they explicitly route to this bot."""
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"allow_bots": "mentions"},
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._bot_user_id = "U_BOT"
+        adapter._running = True
+        adapter.handle_message = AsyncMock()
+
+        event = {
+            "text": "<@U_BOT> handoff accepted",
+            "bot_id": "B_OTHER",
+            "user": "U_OTHER_BOT",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "2234567890.000006",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "handoff accepted"
 
     @pytest.mark.asyncio
     async def test_bot_messages_ignored(self, adapter):
