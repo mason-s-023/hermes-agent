@@ -1,0 +1,35 @@
+name: queue-platform
+label: Queue
+kind: platform
+version: 1.0.0
+description: >
+  Local SQLite queue gateway adapter for Hermes Agent. Polls the slack_agent
+  bridge queue (slack_inbox) for claimed turns, relays them to the agent, and
+  writes replies back to slack_outbox for the bridge sender to deliver.
+author: charde023
+requires_env:
+  - name: QUEUE_DB_PATH
+    description: "Path to the slack_agent local SQLite queue database"
+    prompt: "Queue SQLite DB path"
+    password: false
+  - name: QUEUE_AGENT
+    description: "Claim target name in the queue (e.g. chami)"
+    prompt: "Queue agent (claim target)"
+    password: false
+  - name: QUEUE_REPO_ROOT
+    description: "slack_agent repo root providing the bridge package"
+    prompt: "slack_agent repo root"
+    password: false
+optional_env:
+  - name: QUEUE_POLL_INTERVAL
+    description: "Polling interval in seconds (default 2.0)"
+    prompt: "Poll interval (seconds)"
+    password: false
+  - name: QUEUE_ALLOWED_SENDERS
+    description: "Comma-separated Slack user IDs allowed to reach the agent"
+    prompt: "Allowed senders (comma-separated)"
+    password: false
+  - name: QUEUE_ALLOW_ALL_USERS
+    description: "Set truthy to allow all senders (overrides the default-deny core authz)"
+    prompt: "Allow all senders (true/false)"
+    password: false
