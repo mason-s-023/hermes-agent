@@ -13,8 +13,8 @@ INSERT 한다(실제 슬랙 발신은 slack_bridge.py 센더가 담당).
   reclaim(reclaim_stale_claimed)이 CLAIM_TTL 경과 후 pending으로 복구한다.
   따라서 재시작 시 유실 대신 재처리(드물게 중복 응답 가능)가 일어난다.
 
-필수 env: QUEUE_DB_PATH / QUEUE_AGENT / QUEUE_REPO_ROOT
-옵션 env: QUEUE_POLL_INTERVAL(기본 2.0초, 최소 0.2초),
+필수 env: QUEUE_AGENT / QUEUE_REPO_ROOT, 그리고 QUEUE_DB_PATH 또는 QUEUE_ENDPOINT
+옵션 env: QUEUE_TOKEN, QUEUE_POLL_INTERVAL(기본 2.0초, 최소 0.2초),
          QUEUE_ALLOWED_SENDERS(콤마 구분), QUEUE_ALLOW_ALL_USERS
 """
 
@@ -153,6 +153,8 @@ class QueueAdapter(BasePlatformAdapter):
 
         extra = config.extra or {}
         self._db_path = (os.getenv("QUEUE_DB_PATH", "") or str(extra.get("db_path", ""))).strip()
+        self._endpoint = (os.getenv("QUEUE_ENDPOINT", "") or str(extra.get("endpoint", ""))).strip()
+        self._token = (os.getenv("QUEUE_TOKEN", "") or str(extra.get("token", ""))).strip()
         self._agent = (os.getenv("QUEUE_AGENT", "") or str(extra.get("agent", ""))).strip()
         self._repo_root = (os.getenv("QUEUE_REPO_ROOT", "") or str(extra.get("repo_root", ""))).strip()
         self._poll_interval = max(
@@ -169,20 +171,21 @@ class QueueAdapter(BasePlatformAdapter):
         self._last_reclaim = 0.0
 
         logger.info(
-            "[Queue] Adapter initialized (db=%s, agent=%s)", self._db_path, self._agent
+            "[Queue] Adapter initialized (db=%s, endpoint=%s, agent=%s)",
+            self._db_path,
+            self._endpoint,
+            self._agent,
         )
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """필수 설정 검증 후 bridge repo를 열고 폴링 태스크를 시작한다."""
-        missing = [
-            name
-            for name, value in (
-                ("QUEUE_DB_PATH", self._db_path),
-                ("QUEUE_AGENT", self._agent),
-                ("QUEUE_REPO_ROOT", self._repo_root),
-            )
-            if not value
+        required = [
+            ("QUEUE_AGENT", self._agent),
+            ("QUEUE_REPO_ROOT", self._repo_root),
         ]
+        if not self._endpoint:
+            required.insert(0, ("QUEUE_DB_PATH", self._db_path))
+        missing = [name for name, value in required if not value]
         if missing:
             message = (
                 "Not configured — missing "
@@ -204,9 +207,13 @@ class QueueAdapter(BasePlatformAdapter):
             sys.path.append(self._repo_root)
         try:
             def _load_repo():
-                from bridge.local_repo import SQLiteQueueRepo
+                from bridge.agent_repo import make_agent_queue_repo
 
-                return SQLiteQueueRepo(self._db_path)
+                return make_agent_queue_repo(
+                    db_path=self._db_path,
+                    endpoint=self._endpoint,
+                    token=self._token,
+                )
 
             # 생성자가 sqlite connect + DDL(blocking, busy 시 최대 30초)을
             # 수행하므로 이벤트루프 밖(스레드)에서 만든다.
@@ -214,7 +221,8 @@ class QueueAdapter(BasePlatformAdapter):
         except Exception as e:
             message = (
                 f"Failed to load slack_agent bridge repo "
-                f"(QUEUE_REPO_ROOT={self._repo_root}, QUEUE_DB_PATH={self._db_path}): {e}"
+                f"(QUEUE_REPO_ROOT={self._repo_root}, QUEUE_DB_PATH={self._db_path}, "
+                f"QUEUE_ENDPOINT={self._endpoint}): {e}"
             )
             logger.error("[Queue] %s", message, exc_info=True)
             self._set_fatal_error("queue_repo_import_failed", message, retryable=False)
@@ -224,7 +232,7 @@ class QueueAdapter(BasePlatformAdapter):
         self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info(
             "[Queue] Connected — polling %s as target '%s' (interval %.2fs)",
-            self._db_path, self._agent, self._poll_interval,
+            self._endpoint or self._db_path, self._agent, self._poll_interval,
         )
         return True
 
@@ -469,7 +477,7 @@ class QueueAdapter(BasePlatformAdapter):
 
 
 def _is_connected(config) -> bool:
-    """세 필수 설정(db_path/agent/repo_root)이 모두 있어야 활성으로 판정."""
+    """필수 설정(agent/repo_root + db_path 또는 endpoint)이 있어야 활성으로 판정."""
     extra = getattr(config, "extra", {}) or {}
 
     def _value(extra_key: str, env_name: str) -> str:
@@ -480,14 +488,13 @@ def _is_connected(config) -> bool:
 
         return (gateway_mod.get_env_value(env_name) or "").strip()
 
-    return all(
-        _value(key, env)
-        for key, env in (
-            ("db_path", "QUEUE_DB_PATH"),
-            ("agent", "QUEUE_AGENT"),
-            ("repo_root", "QUEUE_REPO_ROOT"),
-        )
-    )
+    required = [
+        ("agent", "QUEUE_AGENT"),
+        ("repo_root", "QUEUE_REPO_ROOT"),
+    ]
+    if not _value("endpoint", "QUEUE_ENDPOINT"):
+        required.insert(0, ("db_path", "QUEUE_DB_PATH"))
+    return all(_value(key, env) for key, env in required)
 
 
 def _build_adapter(config):
@@ -508,8 +515,8 @@ async def _standalone_send(
 
     standalone_sender_fn 계약(email 어댑터와 동일 시그니처·반환)을 구현한다.
     cron/러너가 게이트웨이와 다른 프로세스로 돌 때 send_message가 이 경로로
-    떨어진다. QUEUE_DB_PATH/QUEUE_AGENT/QUEUE_REPO_ROOT는 pconfig.extra 우선,
-    없으면 os.getenv 폴백. send()와 동일한 라우팅(_route_and_insert)을 쓴다.
+    떨어진다. QUEUE_AGENT/QUEUE_REPO_ROOT와 QUEUE_DB_PATH 또는 QUEUE_ENDPOINT는
+    pconfig.extra 우선, 없으면 os.getenv 폴백. send()와 동일한 라우팅(_route_and_insert)을 쓴다.
 
     ⚠️ 아웃바운드 handoff의 발신자 인가 결합: 여기서 만드는 handoff row는
     slack_user_id=<발신 에이전트 키>로 박히므로, 수신 에이전트가 자기
@@ -526,12 +533,14 @@ async def _standalone_send(
         return os.getenv(env_name, "").strip()
 
     db_path = _cfg("db_path", "QUEUE_DB_PATH")
+    endpoint = _cfg("endpoint", "QUEUE_ENDPOINT")
+    token = _cfg("token", "QUEUE_TOKEN")
     agent = _cfg("agent", "QUEUE_AGENT")
     repo_root = _cfg("repo_root", "QUEUE_REPO_ROOT")
-    if not all([db_path, agent, repo_root]):
+    if not all([agent, repo_root]) or (not db_path and not endpoint):
         return {
             "error": "Queue not configured "
-            "(QUEUE_DB_PATH, QUEUE_AGENT, QUEUE_REPO_ROOT required)"
+            "(QUEUE_AGENT, QUEUE_REPO_ROOT, and QUEUE_DB_PATH or QUEUE_ENDPOINT required)"
         }
 
     # append(insert(0) 금지): slack_agent 루트의 최상위 config.py(시크릿) 등이
@@ -540,9 +549,9 @@ async def _standalone_send(
         sys.path.append(repo_root)
 
     def _do():
-        from bridge.local_repo import SQLiteQueueRepo
+        from bridge.agent_repo import make_agent_queue_repo
 
-        repo = SQLiteQueueRepo(db_path)
+        repo = make_agent_queue_repo(db_path=db_path, endpoint=endpoint, token=token)
         return _route_and_insert(repo, agent, chat_id, message, thread_id)
 
     try:
@@ -560,8 +569,8 @@ def register(ctx) -> None:
         adapter_factory=_build_adapter,
         check_fn=check_queue_requirements,
         is_connected=_is_connected,
-        required_env=["QUEUE_DB_PATH", "QUEUE_AGENT", "QUEUE_REPO_ROOT"],
-        install_hint="Queue uses the Python stdlib (sqlite3 via slack_agent bridge) — no extra deps",
+        required_env=["QUEUE_AGENT", "QUEUE_REPO_ROOT"],
+        install_hint="Queue uses slack_agent bridge; set QUEUE_DB_PATH for local SQLite or QUEUE_ENDPOINT/QUEUE_TOKEN for HTTP",
         allowed_users_env="QUEUE_ALLOWED_SENDERS",
         allow_all_env="QUEUE_ALLOW_ALL_USERS",
         standalone_sender_fn=_standalone_send,

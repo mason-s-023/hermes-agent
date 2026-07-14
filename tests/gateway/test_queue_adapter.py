@@ -34,7 +34,10 @@ from unittest.mock import MagicMock, patch
 SLACK_AGENT_ROOT = os.environ.get(
     "QUEUE_TEST_REPO_ROOT", "/Users/charde023/workspace/slack_agent"
 )
-_HAS_SLACK_AGENT = Path(SLACK_AGENT_ROOT, "bridge", "local_repo.py").is_file()
+_HAS_SLACK_AGENT = (
+    Path(SLACK_AGENT_ROOT, "bridge", "local_repo.py").is_file()
+    and Path(SLACK_AGENT_ROOT, "bridge", "agent_repo.py").is_file()
+)
 
 if _HAS_SLACK_AGENT and SLACK_AGENT_ROOT not in sys.path:
     # append — insert(0)은 slack_agent 루트의 config.py(시크릿) 등이 전역
@@ -65,6 +68,8 @@ class QueueAdapterTestBase(unittest.TestCase):
         self.addCleanup(env_guard.stop)
         os.environ.pop("QUEUE_ALLOWED_SENDERS", None)
         os.environ.pop("QUEUE_ALLOW_ALL_USERS", None)
+        os.environ.pop("QUEUE_ENDPOINT", None)
+        os.environ.pop("QUEUE_TOKEN", None)
 
     def make_adapter(self, env_overrides=None, remove=()):
         env = dict(env_overrides) if env_overrides else {}
@@ -126,6 +131,24 @@ class TestConnectMissingConfig(QueueAdapterTestBase):
 
     def test_missing_db_path(self):
         self._assert_fatal_missing("QUEUE_DB_PATH")
+
+    def test_missing_db_path_allowed_when_endpoint_present(self):
+        adapter = self.make_adapter(
+            env_overrides={"QUEUE_ENDPOINT": "http://127.0.0.1:8770"},
+            remove=("QUEUE_DB_PATH",),
+        )
+        adapter._message_handler = MagicMock()
+
+        from bridge import agent_repo
+
+        with patch.object(agent_repo, "make_agent_queue_repo", return_value=self.make_repo()) as make_repo:
+            ok = asyncio.run(adapter.connect())
+
+        self.assertTrue(ok)
+        make_repo.assert_called_once_with(
+            db_path="", endpoint="http://127.0.0.1:8770", token=""
+        )
+        asyncio.run(adapter.disconnect())
 
     def test_missing_agent(self):
         self._assert_fatal_missing("QUEUE_AGENT")

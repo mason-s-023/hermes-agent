@@ -9,7 +9,7 @@ tmp SQLite + env 픽스처. sys.path 조작(QUEUE_REPO_ROOT)은 tool 본체가 �
 
 커버:
 T1 정상 handoff -> slack_inbox에 target/slack_user_id/text row 생성 + success 반환
-T2 check_fn: 필수 env(QUEUE_DB_PATH/QUEUE_AGENT/QUEUE_REPO_ROOT) 각각 누락 시 False, 다 있으면 True
+T2 check_fn: QUEUE_AGENT/QUEUE_REPO_ROOT + QUEUE_DB_PATH 또는 QUEUE_ENDPOINT 필요
 T3 (negative) to=자기자신 / to="" / to=raw 슬랙채널ID -> error + insert 없음
 T4 (registry) import 시 registry에 name=queue_handoff 자동 등록(toolset/check_fn/is_async)
 T5 반환 형식이 도구 반환 규약(JSON str: success/target/message_id 또는 error)과 일치
@@ -30,7 +30,10 @@ from unittest.mock import patch
 SLACK_AGENT_ROOT = os.environ.get(
     "QUEUE_TEST_REPO_ROOT", "/Users/charde023/workspace/slack_agent"
 )
-_HAS_SLACK_AGENT = Path(SLACK_AGENT_ROOT, "bridge", "local_repo.py").is_file()
+_HAS_SLACK_AGENT = (
+    Path(SLACK_AGENT_ROOT, "bridge", "local_repo.py").is_file()
+    and Path(SLACK_AGENT_ROOT, "bridge", "agent_repo.py").is_file()
+)
 
 if _HAS_SLACK_AGENT and SLACK_AGENT_ROOT not in sys.path:
     # append — insert(0)은 slack_agent 루트의 config.py(시크릿)가 전역 최우선
@@ -55,7 +58,7 @@ class QueueHandoffToolTestBase(unittest.TestCase):
         env_guard.start()
         self.addCleanup(env_guard.stop)
         # 주변 셸/게이트웨이 세션 env가 새어 위양성을 내지 않게 정리.
-        for k in ("HERMES_SESSION_THREAD_ID", "HERMES_SESSION_CHAT_ID"):
+        for k in ("HERMES_SESSION_THREAD_ID", "HERMES_SESSION_CHAT_ID", "QUEUE_ENDPOINT", "QUEUE_TOKEN"):
             os.environ.pop(k, None)
 
     def make_repo(self):
@@ -129,21 +132,36 @@ class TestHandoffInsert(QueueHandoffToolTestBase):
 
 
 class TestCheckFn(QueueHandoffToolTestBase):
-    """T2: check_fn — 필수 env 모두 있으면 True, 하나라도 없으면 False."""
+    """T2: check_fn — agent/root + db_path 또는 endpoint가 필요."""
 
     def test_all_env_present_true(self):
         from tools.queue_handoff_tool import check_queue_handoff
 
         self.assertTrue(check_queue_handoff())
 
-    def test_missing_env_false(self):
+    def test_missing_agent_or_repo_root_false(self):
         from tools.queue_handoff_tool import check_queue_handoff
 
-        for key in ("QUEUE_DB_PATH", "QUEUE_AGENT", "QUEUE_REPO_ROOT"):
+        for key in ("QUEUE_AGENT", "QUEUE_REPO_ROOT"):
             with self.subTest(missing=key):
                 with patch.dict(os.environ, {}, clear=False):
                     os.environ.pop(key, None)
                     self.assertFalse(check_queue_handoff())
+
+    def test_missing_db_path_false_without_endpoint(self):
+        from tools.queue_handoff_tool import check_queue_handoff
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QUEUE_DB_PATH", None)
+            os.environ.pop("QUEUE_ENDPOINT", None)
+            self.assertFalse(check_queue_handoff())
+
+    def test_endpoint_allows_missing_db_path(self):
+        from tools.queue_handoff_tool import check_queue_handoff
+
+        with patch.dict(os.environ, {"QUEUE_ENDPOINT": "http://127.0.0.1:8770"}, clear=False):
+            os.environ.pop("QUEUE_DB_PATH", None)
+            self.assertTrue(check_queue_handoff())
 
 
 class TestDefenses(QueueHandoffToolTestBase):

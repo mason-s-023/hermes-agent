@@ -12,8 +12,8 @@ send_message와의 차이: **외부 플랫폼(슬랙/텔레그램 등) 발신이
 발신자 정체성 = ``QUEUE_AGENT`` env(프로세스 고정). 현재 대화 스레드 =
 ``HERMES_SESSION_THREAD_ID``(있으면 이어감).
 
-필수 env: QUEUE_AGENT / QUEUE_DB_PATH / QUEUE_REPO_ROOT.
-선택 env: QUEUE_KNOWN_AGENTS(콤마 구분 — 기본 로스터 chami/chadol/mei/anna/jeff
+필수 env: QUEUE_AGENT / QUEUE_REPO_ROOT, 그리고 QUEUE_DB_PATH 또는 QUEUE_ENDPOINT.
+선택 env: QUEUE_TOKEN, QUEUE_KNOWN_AGENTS(콤마 구분 — 기본 로스터 chami/chadol/mei/anna/jeff
          밖의 에이전트를 handoff 대상으로 허용).
 
 ⚠️ 수신측 인가(숨은 전제): handoff row는 slack_user_id=<발신 에이전트 키>로 박히고,
@@ -60,13 +60,28 @@ def _known_agents() -> set:
 
 
 def check_queue_handoff() -> bool:
-    """큐가 활성(필수 env 3종 모두 존재)일 때만 도구를 노출한다."""
-    return bool(_env("QUEUE_AGENT") and _env("QUEUE_DB_PATH") and _env("QUEUE_REPO_ROOT"))
+    """큐가 활성(필수 env + local db 또는 HTTP endpoint)일 때만 도구를 노출한다."""
+    return bool(
+        _env("QUEUE_AGENT")
+        and _env("QUEUE_REPO_ROOT")
+        and (_env("QUEUE_DB_PATH") or _env("QUEUE_ENDPOINT"))
+    )
 
 
-def _do_insert(repo_root: str, db_path: str, *, event_ts: str, channel_id: str,
-               thread_ts: str, agent: str, message: str, target: str) -> bool:
-    """blocking sqlite 삽입 — asyncio.to_thread로 감싸 호출한다.
+def _do_insert(
+    repo_root: str,
+    db_path: str,
+    *,
+    endpoint: str,
+    token: str,
+    event_ts: str,
+    channel_id: str,
+    thread_ts: str,
+    agent: str,
+    message: str,
+    target: str,
+) -> bool:
+    """blocking 큐 삽입 — asyncio.to_thread로 감싸 호출한다.
 
     QUEUE_REPO_ROOT를 sys.path에 **append**(insert(0) 금지 — slack_agent 루트의
     config.py 시크릿이 전역 최우선 import 되는 걸 막는다)한 뒤 bridge 패키지를
@@ -74,9 +89,9 @@ def _do_insert(repo_root: str, db_path: str, *, event_ts: str, channel_id: str,
     """
     if repo_root and repo_root not in sys.path:
         sys.path.append(repo_root)
-    from bridge.local_repo import SQLiteQueueRepo
+    from bridge.agent_repo import make_agent_queue_repo
 
-    repo = SQLiteQueueRepo(db_path)
+    repo = make_agent_queue_repo(db_path=db_path, endpoint=endpoint, token=token)
     return repo.insert_inbox(
         slack_event_ts=event_ts,
         channel_id=channel_id,
@@ -94,9 +109,13 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
         return tool_error("QUEUE_AGENT is not set — cannot identify sender agent")
 
     db_path = _env("QUEUE_DB_PATH")
+    endpoint = _env("QUEUE_ENDPOINT")
+    token = _env("QUEUE_TOKEN")
     repo_root = _env("QUEUE_REPO_ROOT")
-    if not db_path or not repo_root:
-        return tool_error("queue is not configured (QUEUE_DB_PATH/QUEUE_REPO_ROOT missing)")
+    if not repo_root or (not db_path and not endpoint):
+        return tool_error(
+            "queue is not configured (QUEUE_REPO_ROOT and QUEUE_DB_PATH or QUEUE_ENDPOINT missing)"
+        )
 
     to = ((args or {}).get("to") or "").strip()
     message = (args or {}).get("message")
@@ -150,6 +169,8 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
             _do_insert,
             repo_root,
             db_path,
+            endpoint=endpoint,
+            token=token,
             event_ts=event_ts,
             channel_id=channel_id,
             thread_ts=thread_ts,
