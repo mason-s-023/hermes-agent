@@ -21,8 +21,10 @@ INSERT 한다(실제 슬랙 발신은 slack_bridge.py 센더가 담당).
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import (
@@ -43,6 +45,89 @@ RECLAIM_INTERVAL_SECONDS = 60
 # 0/음수 폴링 간격은 공유 라이브 SQLite(slack_bridge와 공유) 상대 busy-loop이
 # 되므로 하한을 강제한다.
 MIN_POLL_INTERVAL_SECONDS = 0.2
+
+# send() 라우팅 접두 규약.
+#   "queue:<slack채널>"  → 자동 응답(코어가 인바운드 턴에 답) → slack_outbox.
+#   그 외(에이전트 키)    → 아웃바운드 handoff → 상대 target의 slack_inbox.
+# 인바운드 턴은 build_source에서 이 접두로 정규화되므로(_dispatch_turn) 자기
+# 채널로의 응답이 handoff로 오분류되지 않는다. slack_bridge 센더는 raw 슬랙
+# 채널만 발송 허용(allowed_channel_ids 게이트)하므로 outbox 삽입 직전 접두를 벗긴다.
+_REPLY_CHANNEL_PREFIX = "queue:"
+# 아웃바운드 handoff의 합성 event_ts/thread_ts 접두(슬랙 ts와 충돌 없는 고유값).
+_HANDOFF_EVENT_PREFIX = "qho-"
+# raw 슬랙 채널ID(C/G/D + 영숫자) 패턴 — 에이전트 키가 아니라 채널ID가 큐
+# handoff target으로 잘못 넘어온 경우를 식별한다. 에이전트 키는 소문자라
+# (chami/chadol/mei/anna/jeff) 이 대문자 접두 패턴에 매치되지 않는다.
+_SLACK_CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{7,}$")
+
+
+def _normalize_reply_channel(channel: str) -> str:
+    """인바운드 채널을 자동응답용 'queue:<채널>' 형태로 정규화(멱등)."""
+    channel = channel or ""
+    if channel.startswith(_REPLY_CHANNEL_PREFIX):
+        return channel
+    return _REPLY_CHANNEL_PREFIX + channel
+
+
+def _route_and_insert(repo, agent: str, target: str, content: str, thread_hint) -> Dict[str, Any]:
+    """큐 send 라우팅(blocking) — send()와 _standalone_send() 공용.
+
+    - target이 'queue:' 접두면 자동 응답 → insert_outbox(raw 채널로 접두 제거).
+    - 그 외(에이전트 키) → 아웃바운드 handoff → insert_inbox(target=상대).
+
+    반환은 standalone_sender_fn 계약(dict)과 동일: {"success": True, "message_id": ...}
+    또는 {"error": str}. 방어: 빈 target·자기 자신 target·raw 슬랙 채널ID는
+    삽입 없이 에러.
+
+    ⚠️ 발신자 인가 결합(숨은 전제): handoff row는 slack_user_id=<발신 에이전트
+    키>(예 'chami')로 박힌다. 수신 에이전트의 코어 authz는 default-deny라,
+    수신측이 자기 QUEUE_ALLOWED_SENDERS에 이 발신 에이전트 키를 넣거나
+    QUEUE_ALLOW_ALL_USERS를 켜지 않으면 handoff가 "sender not allowed"로 error
+    마킹되고 소실된다. 즉 여기서 success=True가 나도 수신측 게이팅에 따라 조용히
+    버려질 수 있다(코드 우회는 M2 — 지금은 이 전제만 문서화). """
+    target = (target or "").strip()
+    if not target:
+        return {"error": "empty target"}
+
+    if target.startswith(_REPLY_CHANNEL_PREFIX):
+        channel = target[len(_REPLY_CHANNEL_PREFIX):]
+        row_id = repo.insert_outbox(
+            channel_id=channel,
+            thread_ts=str(thread_hint or ""),
+            text=content,
+            created_by=f"queue:{agent}",
+        )
+        return {"success": True, "message_id": str(row_id)}
+
+    if target == agent:
+        # 자기 자신에게 handoff = 무한 루프 위험 → 삽입 없이 거부.
+        return {"error": "cannot handoff to self"}
+
+    if _SLACK_CHANNEL_ID_RE.match(target):
+        # raw 슬랙 채널ID('C0B69KP8G2J' 등)는 handoff target(에이전트 키)이 아니다.
+        # 그대로 insert하면 아무 워커도 처리 못 하는 죽은 row가 생기고, 발신자에겐
+        # success로 보여 실패가 은폐된다. 자동 응답이라면 'queue:<채널>' 접두를
+        # 써야 outbox로 간다 → 여기선 삽입 없이 명시적으로 거부한다.
+        return {"error": "looks like a raw slack channel id, not a queue handoff target"}
+
+    event_ts = f"{_HANDOFF_EVENT_PREFIX}{uuid.uuid4()}"
+    thread_ts = str(thread_hint) if thread_hint else f"{_HANDOFF_EVENT_PREFIX}{uuid.uuid4()}"
+    inserted = repo.insert_inbox(
+        slack_event_ts=event_ts,
+        channel_id=f"{_REPLY_CHANNEL_PREFIX}handoff:{agent}->{target}",
+        thread_ts=thread_ts,
+        slack_user_id=agent,
+        text=content,
+        target=target,
+    )
+    if not inserted:
+        # event_ts는 row 식별자일 뿐이며 매 send마다 새 uuid라, 재시도 시엔 새
+        # event_ts가 생겨 이 UNIQUE 충돌 분기는 사실상 안 탄다(= at-least-once,
+        # 재시도가 중복 handoff를 만들 수 있음). 따라서 이 분기는 "재시도 흡수"가
+        # 아니라 동일 event_ts를 두 번 넣는 드문 경우(테스트·호출자 uuid 고정)만
+        # 방어한다. 진짜 idempotency는 M2에서 검토.
+        return {"error": "duplicate handoff"}
+    return {"success": True, "message_id": event_ts}
 
 
 def check_queue_requirements() -> bool:
@@ -269,9 +354,13 @@ class QueueAdapter(BasePlatformAdapter):
                 self._repo.mark_inbox_error, turn.inbox_id, "sender not allowed"
             )
             return False
+        # 접두 규약 방어: 자동 응답이 handoff로 오분류되지 않게 채널을 'queue:'로
+        # 정규화한다(멱등). send()가 이 접두를 보고 outbox로 라우팅하며, 삽입
+        # 직전 접두를 벗겨 raw 슬랙 채널로 발송한다.
+        reply_channel = _normalize_reply_channel(turn.channel_id)
         source = self.build_source(
-            chat_id=turn.channel_id,
-            chat_name=turn.channel_id,
+            chat_id=reply_channel,
+            chat_name=reply_channel,
             chat_type="channel",
             user_id=turn.slack_user_id,
             user_name=turn.slack_user_id,
@@ -352,30 +441,27 @@ class QueueAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """응답을 slack_outbox에 INSERT 한다(발신은 브리지 센더 담당).
+        """큐로 메시지를 보낸다 — chat_id 접두로 두 경로 분기(_route_and_insert).
+
+        - 'queue:<채널>'  → 자동 응답: slack_outbox INSERT(발신은 브리지 센더).
+        - 그 외(에이전트) → 아웃바운드 handoff: 상대 target의 slack_inbox INSERT.
 
         thread_ts는 코어가 넣어주는 metadata["thread_id"](= source.thread_id)
         우선, 없으면 reply_to(트리거 메시지 ts)로 폴백한다.
         """
         if self._repo is None:
             return SendResult(success=False, error="queue repo not connected")
-        thread_ts = ""
-        if metadata and metadata.get("thread_id"):
-            thread_ts = str(metadata["thread_id"])
-        elif reply_to:
-            thread_ts = str(reply_to)
+        thread_hint = (metadata.get("thread_id") if metadata else None) or reply_to
         try:
-            row_id = await asyncio.to_thread(
-                self._repo.insert_outbox,
-                channel_id=chat_id,
-                thread_ts=thread_ts,
-                text=content,
-                created_by=f"queue:{self._agent}",
+            result = await asyncio.to_thread(
+                _route_and_insert, self._repo, self._agent, chat_id, content, thread_hint
             )
-            return SendResult(success=True, message_id=str(row_id))
         except Exception as e:
             logger.error("[Queue] Send failed to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
+        if result.get("success"):
+            return SendResult(success=True, message_id=result.get("message_id"))
+        return SendResult(success=False, error=result.get("error", "send failed"))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """슬랙 채널 큐 대화의 기본 정보."""
@@ -409,6 +495,63 @@ def _build_adapter(config):
     return QueueAdapter(config)
 
 
+async def _standalone_send(
+    pconfig,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+):
+    """게이트웨이 없이(out-of-process) 큐로 보내는 one-shot 전송.
+
+    standalone_sender_fn 계약(email 어댑터와 동일 시그니처·반환)을 구현한다.
+    cron/러너가 게이트웨이와 다른 프로세스로 돌 때 send_message가 이 경로로
+    떨어진다. QUEUE_DB_PATH/QUEUE_AGENT/QUEUE_REPO_ROOT는 pconfig.extra 우선,
+    없으면 os.getenv 폴백. send()와 동일한 라우팅(_route_and_insert)을 쓴다.
+
+    ⚠️ 아웃바운드 handoff의 발신자 인가 결합: 여기서 만드는 handoff row는
+    slack_user_id=<발신 에이전트 키>로 박히므로, 수신 에이전트가 자기
+    QUEUE_ALLOWED_SENDERS에 이 발신 에이전트 키를 넣거나 QUEUE_ALLOW_ALL_USERS를
+    켜야 handoff가 처리된다. 아니면 수신측 코어 authz(default-deny)가
+    "sender not allowed"로 error 마킹해 소실시킨다(상세: _route_and_insert).
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+
+    def _cfg(extra_key: str, env_name: str) -> str:
+        raw = extra.get(extra_key)
+        if raw:
+            return str(raw).strip()
+        return os.getenv(env_name, "").strip()
+
+    db_path = _cfg("db_path", "QUEUE_DB_PATH")
+    agent = _cfg("agent", "QUEUE_AGENT")
+    repo_root = _cfg("repo_root", "QUEUE_REPO_ROOT")
+    if not all([db_path, agent, repo_root]):
+        return {
+            "error": "Queue not configured "
+            "(QUEUE_DB_PATH, QUEUE_AGENT, QUEUE_REPO_ROOT required)"
+        }
+
+    # append(insert(0) 금지): slack_agent 루트의 최상위 config.py(시크릿) 등이
+    # 전역 최우선 import가 되지 않게 — 어댑터 본체와 동일 규칙.
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
+
+    def _do():
+        from bridge.local_repo import SQLiteQueueRepo
+
+        repo = SQLiteQueueRepo(db_path)
+        return _route_and_insert(repo, agent, chat_id, message, thread_id)
+
+    try:
+        return await asyncio.to_thread(_do)
+    except Exception as e:
+        logger.error("[Queue] Standalone send failed to %s: %s", chat_id, e)
+        return {"error": f"Queue send failed: {e}"}
+
+
 def register(ctx) -> None:
     """플러그인 진입점 — Hermes 플러그인 시스템이 호출한다."""
     ctx.register_platform(
@@ -421,6 +564,7 @@ def register(ctx) -> None:
         install_hint="Queue uses the Python stdlib (sqlite3 via slack_agent bridge) — no extra deps",
         allowed_users_env="QUEUE_ALLOWED_SENDERS",
         allow_all_env="QUEUE_ALLOW_ALL_USERS",
+        standalone_sender_fn=_standalone_send,
         max_message_length=40_000,
         emoji="📬",
     )

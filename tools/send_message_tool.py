@@ -523,6 +523,13 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "queue":
+        # 큐 target은 에이전트 이름(예 'chadol') 또는 'queue:<채널>' 자동응답
+        # 채널이며, 채널 디렉터리 resolve 대상이 아니다(디렉터리에 없어 resolve가
+        # 실패하면 아웃바운드 handoff 도구 경로가 통째로 죽는다). explicit chat_id
+        # 로 통과시켜 resolve를 건너뛰고, 라우팅 분기는 어댑터(_route_and_insert)가
+        # chat_id 접두로 판정한다.
+        return target_ref.strip(), None, True
     if platform_name == "ntfy":
         topic = target_ref.strip()
         if topic:

@@ -43,6 +43,9 @@ _HERMES_CORE_TOOLS = [
     "vision_analyze", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
+    # Queue inter-agent handoff (게이트=check_queue_handoff: QUEUE_* env 3종 —
+    # 큐 활성 프로필만 노출, 큐 미설정 프로필엔 check_fn False로 숨김)
+    "queue_handoff",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
@@ -485,6 +488,15 @@ TOOLSETS = {
 
     "hermes-homeassistant": {
         "description": "Home Assistant bot toolset - smart home event monitoring and control",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    # 층2 큐 플랫폼 — 정적 정의로 resolve_toolset의 동적 plugin 분기(is_registered)를
+    # 우회한다(AIAgent 백그라운드 컨텍스트에서 discover 미보장 문제, 2026-07-14).
+    # queue_handoff는 _HERMES_CORE_TOOLS에 있고 check_queue_handoff(QUEUE_* env)로 게이트.
+    "hermes-queue": {
+        "description": "Queue platform toolset - inter-agent DB-queue handoff (queue_handoff gated on QUEUE_* env)",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
