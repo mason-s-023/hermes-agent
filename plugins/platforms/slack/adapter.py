@@ -106,7 +106,7 @@ def _touch_inbound_heartbeat(event_type: str = "event") -> None:
 
 logger = logging.getLogger(__name__)
 _SLACK_USER_MENTION_TOKEN_RE = re.compile(r"<@([^>\s|]+)(?:\|[^>]+)?>")
-_SLACK_HANDOFF_MARKER_MODE_RE = re.compile(r"^\s*⟦[^⟧]*\|mode=([a-z]+)\b[^⟧]*⟧\s*$")
+_SLACK_HANDOFF_MARKER_MODE_RE = re.compile(r"^\s*⟦[^⟧]*\|mode=([a-z]+)\b[^⟧]*⟧")
 _SLACK_ROUTING_HEADER_SEPARATORS = " \t,"
 
 # ContextVar carrying the user_id of the slash-command invoker.

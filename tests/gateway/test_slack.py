@@ -2095,6 +2095,39 @@ class TestMessageRouting:
         assert "<@U_BOT>" in msg_event.text
 
     @pytest.mark.asyncio
+    async def test_allow_bots_mentions_accepts_same_line_directed_handoff_mention(self):
+        """Production handoffs may put the marker and target mention on one line."""
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"allow_bots": "mentions"},
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        adapter._bot_user_id = "U_BOT"
+        adapter._running = True
+        adapter.handle_message = AsyncMock()
+
+        event = {
+            "text": (
+                "⟦chadol|v1|h=agent:apom-team:collect_ad|hop=2|"
+                "seen=sigma,chadol|mode=reply⟧ <@U_BOT> 차미에게 넘김."
+            ),
+            "bot_id": "B_OTHER",
+            "user": "U_OTHER_BOT",
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "1234567890.000000",
+            "ts": "2234567890.000045",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "mode=reply" in msg_event.text
+        assert "<@U_BOT>" in msg_event.text
+
+    @pytest.mark.asyncio
     async def test_allow_bots_mentions_rejects_final_handoff_body_mention(self):
         """mode=final is a closed loop signal and must not wake the bot."""
         config = PlatformConfig(

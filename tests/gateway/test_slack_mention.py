@@ -346,6 +346,16 @@ def test_directed_handoff_mentions_accepts_reply_marker_body_mention():
     assert adapter._slack_directed_handoff_mentions(text, "U_BOT_123") is True
 
 
+def test_directed_handoff_mentions_accepts_same_line_marker_mention():
+    adapter = _make_adapter()
+    text = (
+        "⟦chadol|v1|h=agent:apom-team:collect_ad|hop=2|"
+        "seen=sigma,chadol|mode=reply⟧ <@U_BOT_123> 차미에게 넘김."
+    )
+    assert adapter._slack_handoff_marker_mode(text) == "reply"
+    assert adapter._slack_directed_handoff_mentions(text, "U_BOT_123") is True
+
+
 def test_directed_handoff_mentions_rejects_final_and_non_marker_body_mentions():
     adapter = _make_adapter()
     assert adapter._slack_directed_handoff_mentions(
@@ -364,6 +374,15 @@ def test_directed_handoff_body_mention_triggers_channel_gate():
         "⟦chadol|v1|h=agent:apom-team:margin-guard|hop=2|"
         "seen=sigma,chadol|mode=reply⟧\n\n"
         "<@U_BOT_123> 차미에게 넘김."
+    )
+    assert _would_process(adapter, text=text) is True
+
+
+def test_directed_handoff_same_line_marker_mention_triggers_channel_gate():
+    adapter = _make_adapter(require_mention=True)
+    text = (
+        "⟦chadol|v1|h=agent:apom-team:collect_ad|hop=2|"
+        "seen=sigma,chadol|mode=reply⟧ <@U_BOT_123> 차미에게 넘김."
     )
     assert _would_process(adapter, text=text) is True
 
